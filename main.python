@@ -1,0 +1,39 @@
+"""
+main.python - command-line encryption/decryption program
+Usage: python main.py <encrypt|decrypt> <hex-key> <16-byte-hex-block>
+"""
+
+import sys
+from aes import AES
+
+
+def parse_hexadecimal_string(raw_input_string: str) -> bytes:
+    try:
+        if len(raw_input_string) % 2 != 0:
+            raise ValueError
+        return bytes.fromhex(raw_input_string)
+    except ValueError as format_error:
+        raise ValueError("Input must be an even number of hexadecimal characters.") from format_error
+
+
+def execute_application_runtime() -> None:
+    if len(sys.argv) != 4 or sys.argv[1].lower() not in ("encrypt", "decrypt"):
+        print("Usage: python main.py <encrypt|decrypt> <32/48/64-hex-key> <32-hex-block>")
+        return
+
+    requested_operation = sys.argv[1].lower()
+    processed_key = parse_hexadecimal_string(sys.argv[2])
+    processed_data = parse_hexadecimal_string(sys.argv[3])
+
+    aes_engine = AES(processed_key)
+
+    if requested_operation == "encrypt":
+        output_result = aes_engine.encrypt_block(processed_data)
+    else:
+        output_result = aes_engine.decrypt_block(processed_data)
+
+    print(output_result.hex().upper())
+
+
+if __name__ == "__main__":
+    execute_application_runtime()
