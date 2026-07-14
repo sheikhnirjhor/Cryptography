@@ -1,0 +1,164 @@
+"""
+aes.py - AES class and encryption/decryption entry points
+AES (FIPS-197) written from scratch. No cryptographic libraries are used.
+"""
+
+from typing import List
+
+
+class AES:
+    """Encrypts or decrypts one 16-byte AES block; supports 128/192/256-bit keys."""
+    
+    def __init__(self, cryptographic_key: bytes) -> None:
+        if len(cryptographic_key) not in (16, 24, 32):
+            raise ValueError("Cryptographic key length must equal exactly 16, 24, or 32 bytes.")
+
+        self._s_box: List[int] = self._generate_forward_substitution_box()
+        self._inverse_s_box: List[int] = [0] * 256
+        
+        for plaintext_val, substitution_val in enumerate(self._s_box):
+            self._inverse_s_box[substitution_val] = plaintext_val
+
+        self._total_rounds: int = (len(cryptographic_key) // 4) + 6
+        self._expanded_key_schedule: List[int] = self._execute_key_expansion(cryptographic_key)
+
+    def encrypt_block(self, plaintext_block: bytes) -> bytes:
+        """Encrypt exactly one 16-byte block."""
+        return self._process_cipher_pipeline(plaintext_block, is_encryption_mode=True)
+
+    def decrypt_block(self, ciphertext_block: bytes) -> bytes:
+        """Decrypt exactly one 16-byte block."""
+        return self._process_cipher_pipeline(ciphertext_block, is_encryption_mode=False)
+
+    def _process_cipher_pipeline(self, target_block: bytes, is_encryption_mode: bool) -> bytes:
+        if len(target_block) != 16:
+            raise ValueError("AES internal execution framework operates strictly on 16-byte blocks.")
+
+        working_state = list(target_block)
+        self._apply_round_key_xor(working_state, round_index=0 if is_encryption_mode else self._total_rounds)
+
+        for round_idx in range(1, self._total_rounds):
+            self._substitute_bytes_layer(working_state, is_encryption_mode)
+            self._shift_rows_layer(working_state, is_encryption_mode)
+
+            # In the inverse cipher, AddRoundKey must precede InvMixColumns.
+            # XOR does not commute with the linear column transformation.
+            if is_encryption_mode:
+                self._mix_columns_layer(working_state, perform_forward_mix=True)
+                self._apply_round_key_xor(working_state, round_index=round_idx)
+            else:
+                self._apply_round_key_xor(working_state, round_index=self._total_rounds - round_idx)
+                self._mix_columns_layer(working_state, perform_forward_mix=False)
+
+        self._substitute_bytes_layer(working_state, is_encryption_mode)
+        self._shift_rows_layer(working_state, is_encryption_mode)
+        self._apply_round_key_xor(working_state, round_index=self._total_rounds if is_encryption_mode else 0)
+
+        return bytes(working_state)
+
+    def _execute_key_expansion(self, base_key: bytes) -> List[int]:
+        # Each round key contains 16 bytes. The key schedule is FIPS-197 section 5.2.
+        key_byte_list = list(base_key)
+        total_schedule_bytes = 16 * (self._total_rounds + 1)
+        schedule_buffer = key_byte_list + [0] * (total_schedule_bytes - len(key_byte_list))
+        round_constant = 1
+
+        for position in range(len(key_byte_list), total_schedule_bytes, 4):
+            working_word = schedule_buffer[position - 4 : position]
+            
+            if position % len(key_byte_list) == 0:
+                working_word = working_word[1:] + working_word[:1]  # RotWord
+                working_word = self._substitute_word_elements(working_word)  # SubWord
+                working_word[0] ^= round_constant
+                round_constant = self._galois_field_xtime(round_constant)
+            elif len(key_byte_list) == 32 and position % len(key_byte_list) == 16:
+                working_word = self._substitute_word_elements(working_word)
+
+            for byte_offset in range(4):
+                schedule_buffer[position + byte_offset] = (
+                    schedule_buffer[position - len(key_byte_list) + byte_offset] ^ working_word[byte_offset]
+                )
+
+        return schedule_buffer
+
+    def _apply_round_key_xor(self, current_state: List[int], round_index: int) -> None:
+        start = round_index * 16
+        for index in range(16):
+            current_state[index] ^= self._expanded_key_schedule[start + index]
+
+    def _substitute_bytes_layer(self, current_state: List[int], use_forward_box: bool) -> None:
+        active_lookup_box = self._s_box if use_forward_box else self._inverse_s_box
+        for index in range(16):
+            current_state[index] = active_lookup_box[current_state[index]]
+
+    def _shift_rows_layer(self, current_state: List[int], use_forward_shift: bool) -> None:
+        # AES state is column-major. Byte index is column * 4 + row.
+        state_snapshot = list(current_state)
+        for row_idx in range(4):
+            shift_magnitude = row_idx if use_forward_shift else -row_idx
+            for col_idx in range(4):
+                current_state[col_idx * 4 + row_idx] = state_snapshot[((col_idx + shift_magnitude) % 4) * 4 + row_idx]
+
+    def _mix_columns_layer(self, current_state: List[int], perform_forward_mix: bool) -> None:
+        for col_idx in range(4):
+            base_idx = col_idx * 4
+            val_a, val_b, val_c, val_d = current_state[base_idx : base_idx + 4]
+            if perform_forward_mix:
+                current_state[base_idx]     = self._finite_field_multiply(val_a, 2) ^ self._finite_field_multiply(val_b, 3) ^ val_c ^ val_d
+                current_state[base_idx + 1] = val_a ^ self._finite_field_multiply(val_b, 2) ^ self._finite_field_multiply(val_c, 3) ^ val_d
+                current_state[base_idx + 2] = val_a ^ val_b ^ self._finite_field_multiply(val_c, 2) ^ self._finite_field_multiply(val_d, 3)
+                current_state[base_idx + 3] = self._finite_field_multiply(val_a, 3) ^ val_b ^ val_c ^ self._finite_field_multiply(val_d, 2)
+            else:
+                current_state[base_idx]     = self._finite_field_multiply(val_a, 14) ^ self._finite_field_multiply(val_b, 11) ^ self._finite_field_multiply(val_c, 13) ^ self._finite_field_multiply(val_d, 9)
+                current_state[base_idx + 1] = self._finite_field_multiply(val_a, 9)  ^ self._finite_field_multiply(val_b, 14) ^ self._finite_field_multiply(val_c, 11) ^ self._finite_field_multiply(val_d, 13)
+                current_state[base_idx + 2] = self._finite_field_multiply(val_a, 13) ^ self._finite_field_multiply(val_b, 9)  ^ self._finite_field_multiply(val_c, 14) ^ self._finite_field_multiply(val_d, 11)
+                current_state[base_idx + 3] = self._finite_field_multiply(val_a, 11) ^ self._finite_field_multiply(val_b, 13) ^ self._finite_field_multiply(val_c, 9)  ^ self._finite_field_multiply(val_d, 14)
+
+    def _substitute_word_elements(self, target_word: List[int]) -> List[int]:
+        return [self._s_box[byte_value] for byte_value in target_word]
+
+    @staticmethod
+    def _galois_field_xtime(byte_value: int) -> int:
+        return ((byte_value << 1) ^ 0x11B) if byte_value & 0x80 else (byte_value << 1) & 0xFF
+
+    @classmethod
+    def _finite_field_multiply(cls, multi_a: int, multi_b: int) -> int:
+        """Multiply in GF(2^8), reduced by x^8+x^4+x^3+x+1 (0x11B)."""
+        calculation_product = 0
+        while multi_b:
+            if multi_b & 1:
+                calculation_product ^= multi_a
+            multi_a = cls._galois_field_xtime(multi_a)
+            multi_b >>= 1
+        return calculation_product
+
+    @classmethod
+    def _calculate_exponentiation(cls, numeric_base: int, operational_exponent: int) -> int:
+        computation_result = 1
+        while operational_exponent:
+            if operational_exponent & 1:
+                computation_result = cls._finite_field_multiply(computation_result, numeric_base)
+            numeric_base = cls._finite_field_multiply(numeric_base, numeric_base)
+            operational_exponent >>= 1
+        return computation_result
+
+    @staticmethod
+    def _rotate_left_uint8(target_byte: int, shift_offset: int) -> int:
+        return ((target_byte << shift_offset) | (target_byte >> (8 - shift_offset))) & 0xFF
+
+    @classmethod
+    def _generate_forward_substitution_box(cls) -> List[int]:
+        """Multiplicative inverse followed by the AES affine transformation."""
+        generated_box: List[int] = []
+        for unique_byte in range(256):
+            multiplicative_inverse = 0 if unique_byte == 0 else cls._calculate_exponentiation(unique_byte, 254)
+            affine_transformation = (
+                multiplicative_inverse ^
+                cls._rotate_left_uint8(multiplicative_inverse, 1) ^
+                cls._rotate_left_uint8(multiplicative_inverse, 2) ^
+                cls._rotate_left_uint8(multiplicative_inverse, 3) ^
+                cls._rotate_left_uint8(multiplicative_inverse, 4) ^
+                0x63
+            )
+            generated_box.append(affine_transformation)
+        return generated_box
